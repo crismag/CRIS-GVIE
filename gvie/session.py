@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import TranscriptEntry
+from .models import TranscriptEntry, TurnEntry
 
 
 class SessionStore:
@@ -23,7 +23,29 @@ class SessionStore:
         self.metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     def append(self, speaker: str, text: str) -> None:
-        """Append one transcript entry to transcript.jsonl."""
+        """Append one transcript entry to transcript.jsonl (legacy helper)."""
         entry = TranscriptEntry(speaker=speaker, text=text)
+        with self.transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(entry.model_dump_json() + "\n")
+
+    def save_turn(
+        self,
+        turn_id: int,
+        speaker: str,
+        text: str,
+        audio_file: str | None = None,
+        started_at: str | None = None,
+        ended_at: str | None = None,
+    ) -> None:
+        """Persist a rich turn record to transcript.jsonl."""
+        now = datetime.now(timezone.utc).isoformat()
+        entry = TurnEntry(
+            turn_id=turn_id,
+            speaker=speaker,
+            audio_file=audio_file,
+            text=text,
+            started_at=started_at or now,
+            ended_at=ended_at or now,
+        )
         with self.transcript_path.open("a", encoding="utf-8") as handle:
             handle.write(entry.model_dump_json() + "\n")
