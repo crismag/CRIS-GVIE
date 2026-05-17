@@ -1,8 +1,9 @@
-"""Run the local CRIS-GVIE MVP voice interaction loop."""
+"""Run the local CRIS-GVIE interviewer workflow."""
 
-from gvie import RuntimeConfig, VoiceRuntime
+from gvie import RuntimeConfig
+from gvie.adapters import create_interviewer_runtime
 
 
 if __name__ == "__main__":
-    runtime = VoiceRuntime(config=RuntimeConfig())
+    runtime = create_interviewer_runtime(RuntimeConfig())
     runtime.run()
