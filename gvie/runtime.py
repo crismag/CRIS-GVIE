@@ -1,28 +1,40 @@
-"""Voice runtime orchestrator."""
+"""Voice runtime orchestrator — VAD-driven automatic turn detection."""
 
-import tempfile
+import queue
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from rich.console import Console
 
+from .audio_events import TurnCompletedPayload
+from .audio_stream import AudioStream
 from .config import RuntimeConfig
 from .llm import OllamaClient
-from .recorder import AudioRecorder
 from .session import SessionStore
+from .silence_detector import SilenceDetector
 from .stt import FasterWhisperSTT
 from .tts import PiperTTS
+from .turn_manager import TurnManager
+from .vad import VoiceActivityDetector
 
 
 class VoiceRuntime:
-    """Coordinates record -> transcribe -> respond -> speak loop."""
+    """Coordinates automatic VAD-driven record → transcribe → respond → speak loop.
+
+    Runtime flow::
+
+        [LISTENING]
+        → user speaks → [SPEECH_STARTED] → [RECORDING]
+        → silence detected → [SILENCE_DETECTED] → [TURN_COMPLETED]
+        → [TRANSCRIBING] → [GENERATING_RESPONSE] → [SPEAKING]
+        → [LISTENING]
+    """
 
     def __init__(self, config: RuntimeConfig | None = None) -> None:
         self.config = config or RuntimeConfig()
         self.console = Console()
-        self.recorder = AudioRecorder(
-            sample_rate=self.config.audio.sample_rate,
-            channels=self.config.audio.channels,
-        )
+
         self.stt = FasterWhisperSTT(
             model_size=self.config.stt.model_size,
             compute_type=self.config.stt.compute_type,
@@ -38,8 +50,31 @@ class VoiceRuntime:
         )
         self.session = SessionStore(base_dir=self.config.sessions.base_dir)
 
+        vad_cfg = self.config.vad
+        self._vad = VoiceActivityDetector(
+            threshold=vad_cfg.threshold,
+            sample_rate=self.config.audio.sample_rate,
+            chunk_size=vad_cfg.chunk_size,
+        )
+        self._silence_detector = SilenceDetector(
+            silence_timeout=vad_cfg.silence_timeout,
+            sample_rate=self.config.audio.sample_rate,
+            chunk_size=vad_cfg.chunk_size,
+        )
+
+        # Queue used to hand completed turns from the audio thread to the
+        # main processing loop (None is the sentinel to stop the loop).
+        self._turn_queue: queue.Queue[TurnCompletedPayload | None] = queue.Queue()
+
+        # Controls whether new turns are accepted (paused during TTS playback).
+        self._paused = threading.Event()
+
     def run(self) -> None:
-        """Run interactive local voice loop."""
+        """Start the VAD-driven voice loop.
+
+        Listens continuously.  No key press required.
+        Press **Ctrl-C** to exit.
+        """
         self.session.start(
             {
                 "ollama_model": self.config.ollama.model,
@@ -47,39 +82,80 @@ class VoiceRuntime:
                 "piper_model": self.config.piper.model_path,
             }
         )
-        self.console.print("[bold green]CRIS-GVIE runtime started.[/bold green]")
+        self.console.print("[bold green]CRIS-GVIE VAD runtime started.[/bold green]")
+        self.console.print("Speak naturally.  Press [bold]Ctrl-C[/bold] to exit.\n")
 
-        while True:
-            action = input("Press Enter to start recording (or type 'q' to quit): ").strip().lower()
-            if action in {"q", "quit", "exit"}:
-                self.console.print("Goodbye.")
-                break
+        turn_manager = TurnManager(
+            vad=self._vad,
+            silence_detector=self._silence_detector,
+            session_dir=self.session.session_dir,
+            on_turn_completed=self._turn_queue.put,
+            console=self.console,
+            chunk_size=self.config.vad.chunk_size,
+            max_recording_duration=self.config.vad.max_recording_duration,
+        )
 
-            input_wav: Path | None = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    input_wav = Path(tmp.name)
+        audio_stream = AudioStream(
+            sample_rate=self.config.audio.sample_rate,
+            chunk_size=self.config.vad.chunk_size,
+            channels=self.config.audio.channels,
+            callback=turn_manager.process_chunk,
+        )
 
-                self.recorder.record_until_enter(input_wav)
-                user_text = self.stt.transcribe(input_wav)
+        self.console.print("[bold cyan][LISTENING][/bold cyan]")
+        audio_stream.start()
 
-                if not user_text:
-                    self.console.print("[yellow]No speech detected. Try again.[/yellow]")
-                    continue
+        try:
+            while True:
+                payload = self._turn_queue.get()
+                if payload is None:
+                    break
+                self._process_turn(payload)
+                self.console.print("[bold cyan][LISTENING][/bold cyan]")
+        except KeyboardInterrupt:
+            self.console.print("\nGoodbye.")
+        finally:
+            audio_stream.stop()
 
-                self.console.print(f"[cyan]You:[/cyan] {user_text}")
-                self.session.append("user", user_text)
+    # ------------------------------------------------------------------
+    # Turn processing
+    # ------------------------------------------------------------------
 
-                ai_text = self.llm.generate(user_text)
-                self.console.print(f"[magenta]AI:[/magenta] {ai_text}")
-                self.session.append("assistant", ai_text)
+    def _process_turn(self, payload: TurnCompletedPayload) -> None:
+        """Transcribe, generate response, speak — then resume listening."""
+        wav_path: Path = payload.wav_path
 
-                self.tts.speak(ai_text)
-            except KeyboardInterrupt:
-                self.console.print("\nInterrupted.")
-                break
-            except Exception as exc:  # pragma: no cover - runtime safeguard
-                self.console.print(f"[red]Runtime error:[/red] {exc}")
-            finally:
-                if input_wav is not None:
-                    input_wav.unlink(missing_ok=True)
+        try:
+            self.console.print("[bold blue][TRANSCRIBING][/bold blue]")
+            user_text = self.stt.transcribe(wav_path)
+
+            if not user_text:
+                self.console.print("[yellow]No speech detected in turn.[/yellow]")
+                return
+
+            self.console.print(f"[cyan]You:[/cyan] {user_text}")
+            ended_at = datetime.now(timezone.utc).isoformat()
+            self.session.save_turn(
+                turn_id=payload.turn_id,
+                speaker="user",
+                text=user_text,
+                audio_file=str(wav_path.name),
+                started_at=payload.started_at,
+                ended_at=ended_at,
+            )
+
+            self.console.print("[bold blue][GENERATING_RESPONSE][/bold blue]")
+            ai_text = self.llm.generate(user_text)
+            self.console.print(f"[magenta]AI:[/magenta] {ai_text}")
+            self.session.save_turn(
+                turn_id=payload.turn_id,
+                speaker="assistant",
+                text=ai_text,
+                started_at=ended_at,
+            )
+
+            self.console.print("[bold blue][SPEAKING][/bold blue]")
+            self.tts.speak(ai_text)
+
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            self.console.print(f"[red]Runtime error:[/red] {exc}")

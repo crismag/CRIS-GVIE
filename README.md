@@ -2,32 +2,51 @@
 
 **Cognitive Reasoning Intelligent Speech — General Voice Interaction Engine**
 
-CRIS-GVIE is a minimal, local-first voice interaction runtime MVP.
-It demonstrates a clean and extensible architecture for a standalone voice loop:
+CRIS-GVIE is a minimal, local-first voice interaction runtime with automatic Voice Activity Detection (VAD).
+It listens continuously, detects when you speak, transcribes, generates an AI response, and plays it back — no key presses required.
 
-1. Record microphone input
-2. Transcribe locally
-3. Send transcript to local Ollama
-4. Generate AI response
-5. Convert response to speech with local Piper
-6. Play audio response
-7. Persist transcript/session history
+1. Automatic speech detection via silero-vad
+2. Transcribe locally with faster-whisper
+3. Generate response with local Ollama
+4. Synthesize speech with local Piper
+5. Play audio response
+6. Persist transcript and audio references per turn
+7. Return to listening state
 
 > This project is intentionally **not** a chatbot platform and does not include cloud infrastructure.
 
 ---
 
-## MVP Architecture
+## Runtime Flow
+
+```text
+[LISTENING]
+→ user speaks → [SPEECH_STARTED] → [RECORDING]
+→ silence detected → [SILENCE_DETECTED] → [TURN_COMPLETED]
+→ [TRANSCRIBING] → [GENERATING_RESPONSE] → [SPEAKING]
+→ [LISTENING]
+```
+
+---
+
+## Architecture
 
 `gvie/runtime.py` orchestrates replaceable providers:
 
-- `gvie/recorder.py` — microphone recording (`sounddevice` + WAV output)
-- `gvie/stt.py` — local speech-to-text (`faster-whisper`)
-- `gvie/llm.py` — local Ollama REST client
-- `gvie/tts.py` — Piper synthesis + local playback
-- `gvie/session.py` — JSONL transcript persistence
-- `gvie/models.py` — transcript entry schema
-- `gvie/config.py` — runtime configuration models
+| Module | Responsibility |
+|---|---|
+| `gvie/vad.py` | silero-vad speech probability classifier |
+| `gvie/audio_stream.py` | continuous non-blocking microphone capture |
+| `gvie/turn_manager.py` | LISTENING → RECORDING → TURN_COMPLETED state machine |
+| `gvie/silence_detector.py` | configurable silence timeout detection |
+| `gvie/stream_buffer.py` | thread-safe rolling audio buffer + WAV export |
+| `gvie/audio_events.py` | `AudioEventType` enum and event payloads |
+| `gvie/stt.py` | local speech-to-text (`faster-whisper`) |
+| `gvie/llm.py` | local Ollama REST client |
+| `gvie/tts.py` | Piper synthesis + local playback |
+| `gvie/session.py` | JSONL transcript persistence |
+| `gvie/models.py` | transcript and turn entry schemas |
+| `gvie/config.py` | runtime configuration models |
 
 Session format:
 
@@ -36,16 +55,16 @@ sessions/
   session_<timestamp>/
     transcript.jsonl
     metadata.json
+    turn_001.wav
+    turn_002.wav
+    ...
 ```
 
-Transcript entries:
+Turn records in `transcript.jsonl`:
 
 ```json
-{
-  "timestamp": "...",
-  "speaker": "user",
-  "text": "..."
-}
+{"turn_id": 1, "speaker": "user", "audio_file": "turn_001.wav", "text": "hello", "started_at": "...", "ended_at": "..."}
+{"turn_id": 1, "speaker": "assistant", "audio_file": null, "text": "Hi there!", "started_at": "...", "ended_at": "..."}
 ```
 
 ---
@@ -62,6 +81,12 @@ cris-gvie/
 ├── gvie/
 │   ├── __init__.py
 │   ├── runtime.py
+│   ├── vad.py
+│   ├── audio_stream.py
+│   ├── turn_manager.py
+│   ├── silence_detector.py
+│   ├── stream_buffer.py
+│   ├── audio_events.py
 │   ├── recorder.py
 │   ├── stt.py
 │   ├── llm.py
@@ -90,6 +115,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+> **Note:** `silero-vad` installs PyTorch as a transitive dependency.
+> First run downloads the VAD model weights (~2 MB) automatically.
+
 ---
 
 ## Ollama Setup
@@ -116,40 +144,59 @@ You can update paths in `gvie/config.py`.
 
 ---
 
-## Run MVP
+## Run
 
 ```bash
 python examples/local_interviewer.py
 ```
 
-Runtime flow:
-
-- Press Enter to start recording
-- Speak
-- Press Enter to stop
-- Runtime transcribes, sends text to Ollama, speaks response, and saves transcript
-- Repeat loop
-
-Quit with `q` at the prompt.
+The runtime starts listening immediately.  Speak naturally and pause for ~1.5 seconds to end your turn.  Press **Ctrl-C** to exit.
 
 ---
 
-## Limitations (MVP)
+## Configuration
+
+All tuneable parameters live in `gvie/config.py`:
+
+| Setting | Default | Description |
+|---|---|---|
+| `VADConfig.threshold` | `0.5` | Speech probability threshold (0–1) |
+| `VADConfig.silence_timeout` | `1.5` | Seconds of silence before turn ends |
+| `VADConfig.chunk_size` | `512` | Audio frames per VAD call (256 or 512) |
+| `VADConfig.max_recording_duration` | `60.0` | Hard recording limit per turn (seconds) |
+| `AudioConfig.sample_rate` | `16000` | Microphone sample rate |
+| `STTConfig.model_size` | `small` | faster-whisper model size |
+| `OllamaConfig.model` | `qwen2.5:14b` | Ollama model name |
+
+Example customisation:
+
+```python
+from gvie import RuntimeConfig, VADConfig, VoiceRuntime
+
+config = RuntimeConfig(
+    vad=VADConfig(threshold=0.4, silence_timeout=2.0),
+)
+VoiceRuntime(config=config).run()
+```
+
+---
+
+## Limitations
 
 - Single-user local CLI runtime only
 - No web UI
 - No cloud deployment
 - No advanced memory/RAG/vector DB
-- No orchestration/distributed components
-- Error handling remains lightweight for demonstrability
+- No wake word detection
+- No full-duplex / interruption support (foundation is in place)
 
 ---
 
 ## Future Roadmap
 
+- Streaming STT and TTS for lower latency
+- Interruption handling (foundation already wired via `AudioEventType`)
 - Provider swapping (STT/TTS/LLM) via config
-- Better device selection for audio input/output
 - Optional SQLite storage backend
-- Push-to-talk controls
-- More robust runtime diagnostics and retries
+- Web interface
 
