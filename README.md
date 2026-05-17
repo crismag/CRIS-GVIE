@@ -3,15 +3,16 @@
 **Cognitive Reasoning Intelligent Speech — General Voice Interaction Engine**
 
 CRIS-GVIE is a minimal, local-first voice interaction runtime with automatic Voice Activity Detection (VAD).
-It listens continuously, detects when you speak, transcribes, generates an AI response, and plays it back — no key presses required.
+It listens continuously, detects when you speak, streams partial transcripts live, refines them incrementally, generates an AI response, and plays it back — no key presses required.
 
 1. Automatic speech detection via silero-vad
-2. Transcribe locally with faster-whisper
-3. Generate response with local Ollama
-4. Synthesize speech with local Piper
-5. Play audio response
-6. Persist transcript and audio references per turn
-7. Return to listening state
+2. Stream transcription locally with faster-whisper
+3. Emit partial transcript updates in real time
+4. Generate response with local Ollama
+5. Synthesize speech with local Piper
+6. Play audio response
+7. Persist transcript and audio references per turn
+8. Return to listening state
 
 > This project is intentionally **not** a chatbot platform and does not include cloud infrastructure.
 
@@ -21,9 +22,10 @@ It listens continuously, detects when you speak, transcribes, generates an AI re
 
 ```text
 [LISTENING]
-→ user speaks → [SPEECH_STARTED] → [RECORDING]
-→ silence detected → [SILENCE_DETECTED] → [TURN_COMPLETED]
-→ [TRANSCRIBING] → [GENERATING_RESPONSE] → [SPEAKING]
+→ user speaks → [SPEECH_STARTED] → [STREAMING]
+→ partial transcript updates
+→ silence detected → [FINALIZED]
+→ [GENERATING_RESPONSE] → [SPEAKING]
 → [LISTENING]
 ```
 
@@ -31,13 +33,20 @@ It listens continuously, detects when you speak, transcribes, generates an AI re
 
 ## Architecture
 
-`gvie/runtime.py` orchestrates replaceable providers:
+`gvie/stream_runtime.py` orchestrates the streaming runtime:
 
 | Module | Responsibility |
 |---|---|
 | `gvie/vad.py` | silero-vad speech probability classifier |
 | `gvie/audio_stream.py` | continuous non-blocking microphone capture |
-| `gvie/turn_manager.py` | LISTENING → RECORDING → TURN_COMPLETED state machine |
+| `gvie/stream_runtime.py` | async streaming runtime loop |
+| `gvie/streaming_stt.py` | rolling-buffer streaming transcription |
+| `gvie/transcript_stream.py` | live transcript event emission and ordering |
+| `gvie/transcript_state.py` | partial/final transcript state |
+| `gvie/incremental_decoder.py` | transcript merge helpers |
+| `gvie/partial_result_manager.py` | partial confidence and stability heuristics |
+| `gvie/transcript_events.py` | transcript event types and payloads |
+| `gvie/turn_manager.py` | legacy LISTENING → RECORDING → TURN_COMPLETED state machine |
 | `gvie/silence_detector.py` | configurable silence timeout detection |
 | `gvie/stream_buffer.py` | thread-safe rolling audio buffer + WAV export |
 | `gvie/audio_events.py` | `AudioEventType` enum and event payloads |
@@ -63,7 +72,7 @@ sessions/
 Turn records in `transcript.jsonl`:
 
 ```json
-{"turn_id": 1, "speaker": "user", "audio_file": "turn_001.wav", "text": "hello", "started_at": "...", "ended_at": "..."}
+{"turn_id": 1, "speaker": "user", "audio_file": "turn_001.wav", "text": "hello", "started_at": "...", "ended_at": "...", "partial_history": ["he", "hello"]}
 {"turn_id": 1, "speaker": "assistant", "audio_file": null, "text": "Hi there!", "started_at": "...", "ended_at": "..."}
 ```
 
@@ -81,8 +90,15 @@ cris-gvie/
 ├── gvie/
 │   ├── __init__.py
 │   ├── runtime.py
+│   ├── stream_runtime.py
 │   ├── vad.py
 │   ├── audio_stream.py
+│   ├── streaming_stt.py
+│   ├── transcript_stream.py
+│   ├── transcript_state.py
+│   ├── transcript_events.py
+│   ├── incremental_decoder.py
+│   ├── partial_result_manager.py
 │   ├── turn_manager.py
 │   ├── silence_detector.py
 │   ├── stream_buffer.py
@@ -150,7 +166,7 @@ You can update paths in `gvie/config.py`.
 python examples/local_interviewer.py
 ```
 
-The runtime starts listening immediately.  Speak naturally and pause for ~1.5 seconds to end your turn.  Press **Ctrl-C** to exit.
+The runtime starts listening immediately. Speak naturally and pause for ~1.5 seconds to finalize your turn. Press **Ctrl-C** to exit.
 
 ---
 
@@ -166,6 +182,9 @@ All tuneable parameters live in `gvie/config.py`:
 | `VADConfig.max_recording_duration` | `60.0` | Hard recording limit per turn (seconds) |
 | `AudioConfig.sample_rate` | `16000` | Microphone sample rate |
 | `STTConfig.model_size` | `small` | faster-whisper model size |
+| `STTConfig.compute_type` | `int8` | faster-whisper compute type |
+| `StreamingSTT.partial_update_interval_ms` | `250` | Partial transcript cadence |
+| `StreamingSTT.max_stream_buffer_seconds` | `30.0` | Rolling STT buffer limit |
 | `OllamaConfig.model` | `qwen2.5:14b` | Ollama model name |
 
 Example customisation:
@@ -195,8 +214,8 @@ VoiceRuntime(config=config).run()
 ## Future Roadmap
 
 - Streaming STT and TTS for lower latency
+- Streaming transcript support with partial updates and finalization
 - Interruption handling (foundation already wired via `AudioEventType`)
 - Provider swapping (STT/TTS/LLM) via config
 - Optional SQLite storage backend
 - Web interface
-

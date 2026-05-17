@@ -36,6 +36,8 @@ class SessionStore:
         audio_file: str | None = None,
         started_at: str | None = None,
         ended_at: str | None = None,
+        partial_history: list[str] | None = None,
+        revision_id: int | None = None,
     ) -> None:
         """Persist a rich turn record to transcript.jsonl."""
         now = datetime.now(timezone.utc).isoformat()
@@ -46,6 +48,8 @@ class SessionStore:
             text=text,
             started_at=started_at or now,
             ended_at=ended_at or now,
+            partial_history=partial_history,
+            revision_id=revision_id,
         )
         with self.transcript_path.open("a", encoding="utf-8") as handle:
             handle.write(entry.model_dump_json() + "\n")
