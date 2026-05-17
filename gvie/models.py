@@ -22,3 +22,5 @@ class TurnEntry(BaseModel):
     text: str
     started_at: str
     ended_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    partial_history: list[str] | None = None
+    revision_id: int | None = None
