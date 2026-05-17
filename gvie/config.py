@@ -59,9 +59,22 @@ class SessionConfig(BaseModel):
 class RuntimeConfig(BaseModel):
     """Top-level runtime config."""
 
+    active_plugin: str = "simple_chat"
+    default_ollama_model: str = "qwen2.5:14b"
+    enable_streaming_transcript: bool = True
+    enable_tts: bool = True
+    session_storage_path: Path = Field(default_factory=lambda: Path("sessions"))
     audio: AudioConfig = Field(default_factory=AudioConfig)
     vad: VADConfig = Field(default_factory=VADConfig)
     stt: STTConfig = Field(default_factory=STTConfig)
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     piper: PiperConfig = Field(default_factory=PiperConfig)
     sessions: SessionConfig = Field(default_factory=SessionConfig)
+
+    def model_post_init(self, __context: object) -> None:
+        """Keep legacy and new session-path settings aligned."""
+        default_path = Path("sessions")
+        if self.session_storage_path != default_path and self.sessions.base_dir == default_path:
+            self.sessions.base_dir = self.session_storage_path
+        elif self.session_storage_path == default_path and self.sessions.base_dir != default_path:
+            self.session_storage_path = self.sessions.base_dir
